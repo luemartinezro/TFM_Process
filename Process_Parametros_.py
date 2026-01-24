@@ -13,7 +13,7 @@ from collections import Counter
 import whisper
 import ffmpeg
 import warnings
-
+from scipy.stats import skew
 
 
 warnings.filterwarnings(
@@ -245,7 +245,7 @@ def normalizacion_audio(audio_path, directorio_origen, directorio_destino):
     # GUARDADO DEL AUDIO
     # =========================
     # Guarda el audio normalizado en disco
-    sf.write(path_dest, y, sr)
+    #sf.write(path_dest, y, sr)
 
     # =========================
     # SALIDA
@@ -299,7 +299,239 @@ def opensmile_parameters_Compare_2016(salida_normalizada):
     # un DataFrame con todas las características extraídas
     return smile.process_file(salida_normalizada)
 
+def extract_all_librosa_features(audio_path):
+    # Función que extrae características acústicas usando librosa a partir de un archivo de audio
 
+    features = {}  
+    # Diccionario donde se almacenarán todas las características extraídas
+
+    # =========================
+    # CARGA DE AUDIO
+    # =========================
+    y, sr = librosa.load(audio_path, sr=None)  
+    # Carga el audio manteniendo la frecuencia de muestreo original
+
+    duration = librosa.get_duration(y=y, sr=sr)  
+    # Calcula la duración total del audio en segundos
+
+    features["duracion_s"] = float(duration)  
+    # Guarda la duración del audio
+
+    features["sr"] = int(sr)  
+    # Guarda la frecuencia de muestreo
+
+    if len(y) == 0:  
+        # Comprueba si el audio está vacío
+        return features  
+        # Si no hay señal, devuelve solo los metadatos
+
+    # =========================
+    # RMS + DETECCIÓN DE SILENCIOS
+    # =========================
+    rms = librosa.feature.rms(y=y)[0]  
+    # Calcula la energía RMS por frame
+
+    features["rms_mean"] = float(np.mean(rms))  
+    # Media del RMS
+
+    features["rms_std"] = float(np.std(rms))  
+    # Desviación estándar del RMS
+
+    features["rms_p25"] = float(np.percentile(rms, 25))  
+    # Percentil 25 del RMS
+
+    features["rms_p50"] = float(np.percentile(rms, 50))  
+    # Percentil 50 (mediana) del RMS
+
+    features["rms_p75"] = float(np.percentile(rms, 75))  
+    # Percentil 75 del RMS
+
+    rms_threshold = np.percentile(rms, 25)  
+    # Define el umbral de silencio como el percentil 25 del RMS
+
+    features["rms_threshold_p25"] = float(rms_threshold)  
+    # Guarda el umbral de silencio
+
+    silent = rms < rms_threshold  
+    # Marca como silenciosos los frames con RMS por debajo del umbral
+
+    features["silence_ratio_rms"] = float(np.mean(silent))  
+    # Proporción de frames silenciosos respecto al total
+
+    # =========================
+    # SEGMENTACIÓN DE SILENCIOS Y VOZ
+    # =========================
+    silence_lengths = []  
+    # Lista para almacenar la duración de segmentos de silencio (en frames)
+
+    voiced_lengths = []  
+    # Lista para almacenar la duración de segmentos con voz (en frames)
+
+    current = silent[0]  
+    # Estado inicial: silencio o voz
+
+    count = 0  
+    # Contador de frames consecutivos
+
+    for s in silent:  
+        # Recorre cada frame clasificado como silencio o voz
+        if s == current:  
+            # Si el estado no cambia
+            count += 1  
+            # Incrementa el contador
+        else:
+            # Si cambia de silencio a voz o viceversa
+            (silence_lengths if current else voiced_lengths).append(count)  
+            # Guarda la longitud del segmento anterior
+            current = s  
+            # Actualiza el estado actual
+            count = 1  
+            # Reinicia el contador
+
+    (silence_lengths if current else voiced_lengths).append(count)  
+    # Añade el último segmento detectado
+
+    hop_length = 512  
+    # Número de muestras entre frames (valor por defecto de librosa)
+
+    frame_duration = hop_length / sr  
+    # Duración temporal de un frame en segundos
+
+    silence_dur = np.array(silence_lengths) * frame_duration  
+    # Convierte las duraciones de silencio a segundos
+
+    voiced_dur = np.array(voiced_lengths) * frame_duration  
+    # Convierte las duraciones de voz a segundos
+
+    features["silence_segments_n"] = int(len(silence_dur))  
+    # Número total de segmentos de silencio
+
+    features["silence_dur_mean_s"] = float(np.mean(silence_dur)) if len(silence_dur) else 0.0  
+    # Duración media de los silencios
+
+    features["silence_dur_std_s"] = float(np.std(silence_dur)) if len(silence_dur) else 0.0  
+    # Desviación estándar de las duraciones de silencio
+
+    features["silence_dur_max_s"] = float(np.max(silence_dur)) if len(silence_dur) else 0.0  
+    # Duración máxima de silencio
+
+    features["voiced_ratio"] = float(np.mean(~silent))  
+    # Proporción de frames con voz
+
+    features["voiced_segments_n"] = int(len(voiced_dur))  
+    # Número de segmentos con voz
+
+    features["voiced_dur_mean_s"] = float(np.mean(voiced_dur)) if len(voiced_dur) else 0.0  
+    # Duración media de los segmentos con voz
+
+    features["voiced_dur_std_s"] = float(np.std(voiced_dur)) if len(voiced_dur) else 0.0  
+    # Desviación estándar de la duración de segmentos con voz
+
+    features["voiced_dur_max_s"] = float(np.max(voiced_dur)) if len(voiced_dur) else 0.0  
+    # Duración máxima de un segmento con voz
+
+    # =========================
+    # F0 / PITCH
+    # =========================
+    f0, _, _ = librosa.pyin(
+        y,
+        fmin=librosa.note_to_hz("C2"),  
+        # Frecuencia mínima esperada de la voz humana
+        fmax=librosa.note_to_hz("C7")  
+        # Frecuencia máxima esperada de la voz humana
+    )
+
+    f0 = f0[~np.isnan(f0)]  
+    # Elimina valores no definidos de F0
+
+    if len(f0):  
+        # Si se detectó pitch
+        features["f0_mean"] = float(np.mean(f0))  
+        # Media del pitch
+        features["f0_std"] = float(np.std(f0))  
+        # Desviación estándar del pitch
+        features["f0_p25"] = float(np.percentile(f0, 25))  
+        # Percentil 25 del pitch
+        features["f0_p75"] = float(np.percentile(f0, 75))  
+        # Percentil 75 del pitch
+        features["f0_range"] = float(np.max(f0) - np.min(f0))  
+        # Rango dinámico del pitch
+    else:
+        # Si no se detecta pitch
+        for k in ["f0_mean", "f0_std", "f0_p25", "f0_p75", "f0_range"]:
+            features[k] = 0.0  
+            # Se asignan ceros para evitar valores nulos
+
+    # =========================
+    # ZERO CROSSING RATE
+    # =========================
+    zcr = librosa.feature.zero_crossing_rate(y=y)[0]  
+    # Calcula la tasa de cruces por cero de la señal
+
+    features["zcr_mean"] = float(np.mean(zcr))  
+    # Media del ZCR
+
+    features["zcr_std"] = float(np.std(zcr))  
+    # Desviación estándar del ZCR
+
+    # =========================
+    # CARACTERÍSTICAS ESPECTRALES
+    # =========================
+    flatness = librosa.feature.spectral_flatness(y=y)[0]  
+    # Calcula la planitud espectral (ruido vs tonalidad)
+
+    features["spectral_flatness_mean"] = float(np.mean(flatness))  
+    # Media de la planitud espectral
+
+    features["spectral_flatness_std"] = float(np.std(flatness))  
+    # Desviación estándar de la planitud espectral
+
+    contrast = librosa.feature.spectral_contrast(y=y, sr=sr)  
+    # Calcula el contraste espectral
+
+    features["spectral_contrast_mean"] = float(np.mean(contrast))  
+    # Media del contraste espectral
+
+    features["spectral_contrast_std"] = float(np.std(contrast))  
+    # Desviación estándar del contraste espectral
+
+    # =========================
+    # MFCC + DELTAS
+    # =========================
+    mfcc = librosa.feature.mfcc(y=y, sr=sr, n_mfcc=13)  
+    # Extrae los coeficientes cepstrales MFCC
+
+    mfcc_d1 = librosa.feature.delta(mfcc)  
+    # Primera derivada temporal de los MFCC
+
+    mfcc_d2 = librosa.feature.delta(mfcc, order=2)  
+    # Segunda derivada temporal de los MFCC
+
+    for i in range(13):  
+        # Itera sobre cada coeficiente MFCC
+        idx = i + 1  
+        # Índice humano (empieza en 1)
+
+        features[f"mfcc{idx}_mean"] = float(np.mean(mfcc[i]))  
+        # Media del MFCC i
+
+        features[f"mfcc{idx}_std"] = float(np.std(mfcc[i]))  
+        # Desviación estándar del MFCC i
+
+        features[f"mfcc{idx}_d1_mean"] = float(np.mean(mfcc_d1[i]))  
+        # Media de la primera derivada del MFCC i
+
+        features[f"mfcc{idx}_d1_std"] = float(np.std(mfcc_d1[i]))  
+        # Desviación estándar de la primera derivada del MFCC i
+
+        features[f"mfcc{idx}_d2_mean"] = float(np.mean(mfcc_d2[i]))  
+        # Media de la segunda derivada del MFCC i
+
+        features[f"mfcc{idx}_d2_std"] = float(np.std(mfcc_d2[i]))  
+        # Desviación estándar de la segunda derivada del MFCC i
+
+    return features  
+    # Devuelve el diccionario con todas las características extraídas
 
 def extract_whisper_spacy_features(audio_path):
     """
@@ -477,9 +709,9 @@ def construir_json_desde_directorio(ruta_base):
             features = opensmile_parameters(quality["audio_normalizado"])
 
             # Extrae parámetros del set Compare 2016 de OpenSMILE
-            features2 = opensmile_parameters_Compare_2016(
-                quality["audio_normalizado"]
-            )
+            #features2 = opensmile_parameters_Compare_2016(
+            #    quality["audio_normalizado"]
+            #)
 
             # Obtiene el nombre del archivo sin extensión
             nombre_audio = archivo.stem.strip()
@@ -495,25 +727,25 @@ def construir_json_desde_directorio(ruta_base):
                 # Nombre del hablante normalizado
                 "name": normalizar_nombre_audio(Path(nombre_audio)),
 
-                # Etiqueta de demencia (a completar posteriormente)
-                "dementia": "",
-
-                # Género estimado a partir del pitch
-                "gender": identificar_genero_pitch(archivo),
-
-                # Etnicidad (placeholder)
-                "ethnicity": "",
-
                 # Score global de calidad del audio
                 "score": quality["score"],
 
                 # Métrica de calidad del audio
                 "calidad": quality["calidad"],
+                
+                # Informacion Extra
+                "ADReSSo21_diagnosis-test":{},
+                "ADReSSo21_diagnosis-train":{},
+                "ADReSSo21_progression-test":{},
+                "ADReSSo21_progression-train":{},
+                "ADReSSo21_progression_file":{},
+                "ADReSSo21_dx-mmse_file":{},
 
+                
                 # Diccionarios para almacenar los distintos parámetros
                 "parametros_librosa": {},
                 "parametros_opensmile": {},
-                "parametros_opensmile_compare": {},
+                #"parametros_opensmile_compare": {},
                 "parametros_whisperSpacy": {}
             }
 
@@ -524,10 +756,10 @@ def construir_json_desde_directorio(ruta_base):
             })
 
             # Convierte y guarda los parámetros OpenSMILE Compare 2016
-            data["parametros_opensmile_compare"].update({
-                k: float(v.iloc[0]) if hasattr(v, "iloc") else float(v)
-                for k, v in features2.items()
-            })
+            #data["parametros_opensmile_compare"].update({
+            #    k: float(v.iloc[0]) if hasattr(v, "iloc") else float(v)
+            #    for k, v in features2.items()
+            #})
 
             # Extrae y guarda características acústicas con librosa
             data["parametros_librosa"].update(
